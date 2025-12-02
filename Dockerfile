@@ -1,8 +1,8 @@
-# Официальный образ Node.js LTS – лучше всего подходит для better-sqlite3
+# Базовый образ Node.js
 FROM node:18
 
-# Создаем рабочую директорию внутри контейнера
-WORKDIR /app
+# Рабочая директория
+WORKDIR /usr/src/app
 
 # Копируем package.json и package-lock.json
 COPY package*.json ./
@@ -10,11 +10,14 @@ COPY package*.json ./
 # Устанавливаем зависимости
 RUN npm install
 
-# Копируем весь проект внутрь контейнера
+# Копируем всё приложение
 COPY . .
 
-# Открываем порт для Render (он использует $PORT)
-EXPOSE 3000
+# Порт, который Render использует по умолчанию
+ENV PORT 3000
+
+# Создаём папку для базы
+RUN mkdir -p ./data
 
 # Запуск сервера
 CMD ["node", "server.js"]
