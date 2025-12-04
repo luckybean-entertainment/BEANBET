@@ -1,161 +1,139 @@
 import express from "express";
 import cors from "cors";
 import Database from "better-sqlite3";
+import crypto from "crypto";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------------------------
-// DATABASE INIT
-// ---------------------------
 const db = new Database("database.db");
 
-// Создаём таблицу пользователей
+// === Создание таблицы ===
 db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE,
     password TEXT,
-    balance INTEGER DEFAULT 0,
-    lastBonus INTEGER DEFAULT 0
-  )
+    balance INTEGER DEFAULT 10000,
+    currency TEXT DEFAULT '₽',
+    token TEXT,
+    lastBankUse INTEGER DEFAULT 0,
+    bankUses INTEGER DEFAULT 0
+);
 `);
-console.log("SQLite DB ready.");
 
-// ---------------------------
-// REGISTER
-// ---------------------------
+// === хелперы ===
+function generateToken() {
+    return crypto.randomBytes(32).toString("hex");
+}
+
+// === регистрация ===
 app.post("/register", (req, res) => {
-  const { username, password } = req.body;
+    const { username, password } = req.body;
 
-  if (!username || !password)
-    return res.json({ success: false, error: "Empty fields" });
+    if (!username || !password)
+        return res.json({ ok: false, error: "Пустые поля" });
 
-  try {
-    db.prepare(
-      "INSERT INTO users (username, password, balance) VALUES (?, ?, ?)"
-    ).run(username, password, 0);
+    const exists = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
 
-    res.json({ success: true });
-  } catch (e) {
-    res.json({ success: false, error: "User exists" });
-  }
+    if (exists)
+        return res.json({ ok: false, error: "Имя занято" });
+
+    const token = generateToken();
+
+    db.prepare(`
+        INSERT INTO users (username, password, token, balance)
+        VALUES (?, ?, ?, ?)
+    `).run(username, password, token, 10000);
+
+    res.json({ ok: true, token });
 });
 
-// ---------------------------
-// LOGIN
-// ---------------------------
+// === вход ===
 app.post("/login", (req, res) => {
-  const { username, password } = req.body;
+    const { username, password } = req.body;
 
-  const row = db
-    .prepare("SELECT * FROM users WHERE username = ? AND password = ?")
-    .get(username, password);
+    if (!username || !password)
+        return res.json({ ok: false, error: "Заполните поля" });
 
-  if (!row) return res.json({ success: false });
+    const user = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
 
-  res.json({
-    success: true,
-    username: row.username,
-    balance: row.balance,
-  });
+    if (!user)
+        return res.json({ ok: false, error: "Аккаунт не найден" });
+
+    if (user.password !== password)
+        return res.json({ ok: false, error: "Пароль неверный" });
+
+    const newToken = generateToken();
+
+    db.prepare("UPDATE users SET token = ? WHERE id = ?").run(newToken, user.id);
+
+    res.json({
+        ok: true,
+        token: newToken
+    });
 });
 
-// ---------------------------
-// GET BALANCE
-// ---------------------------
-app.get("/balance", (req, res) => {
-  const username = req.query.username;
+// === автовход ===
+app.post("/auto", (req, res) => {
+    const { token } = req.body;
 
-  if (!username)
-    return res.status(400).json({ error: "Username required" });
+    if (!token)
+        return res.json({ ok: false });
 
-  const row = db
-    .prepare("SELECT balance FROM users WHERE username = ?")
-    .get(username);
+    const user = db.prepare("SELECT * FROM users WHERE token = ?").get(token);
 
-  if (!row) return res.status(404).json({ error: "User not found" });
+    if (!user)
+        return res.json({ ok: false });
 
-  res.json({ balance: row.balance });
+    res.json({
+        ok: true,
+        username: user.username,
+        balance: user.balance,
+        currency: user.currency
+    });
 });
 
-// ---------------------------
-// GIVE 1 000 000 (3 times/day)
-// ---------------------------
-app.post("/give-million", (req, res) => {
-  const { username } = req.body;
+// === Банк: получить 1 млн ===
+app.post("/bank/add", (req, res) => {
+    const { token } = req.body;
+    const user = db.prepare("SELECT * FROM users WHERE token = ?").get(token);
 
-  if (!username)
-    return res.json({ success: false, error: "No username" });
+    if (!user)
+        return res.json({ ok: false });
 
-  const user = db
-    .prepare("SELECT balance, lastBonus FROM users WHERE username = ?")
-    .get(username);
+    const now = Date.now();
+    const isNewDay = now - user.lastBankUse > 86400000;
 
-  if (!user)
-    return res.json({ success: false, error: "User not found" });
+    let uses = user.bankUses;
 
-  const now = Date.now();
-  const oneDay = 24 * 60 * 60 * 1000;
+    if (isNewDay) uses = 0;
 
-  let bonusUses = 0;
-  let lastBonus = user.lastBonus;
+    if (uses >= 3)
+        return res.json({ ok: false, error: "Лимит 3 раза" });
 
-  // Если прошло больше суток — сбрасываем счётчик
-  if (now - lastBonus > oneDay) {
-    bonusUses = 0;
-    lastBonus = now;
-  } else {
-    bonusUses = db
-      .prepare("SELECT COUNT(*) AS c FROM bonuslog WHERE username = ? AND date > ?")
-      .get(username, now - oneDay).c || 0;
-  }
+    db.prepare(`
+        UPDATE users
+        SET balance = balance + 1000000,
+            lastBankUse = ?,
+            bankUses = ?
+        WHERE id = ?
+    `).run(now, uses + 1, user.id);
 
-  if (bonusUses >= 3) {
-    return res.json({ success: false, error: "Daily limit reached" });
-  }
-
-  // Добавляем деньги
-  db.prepare("UPDATE users SET balance = balance + 1000000, lastBonus = ? WHERE username = ?")
-    .run(now, username);
-
-  // Логируем получение бонуса
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS bonuslog (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT,
-      date INTEGER
-    )
-  `);
-
-  db.prepare("INSERT INTO bonuslog (username, date) VALUES (?, ?)").run(username, now);
-
-  res.json({ success: true, newBalance: user.balance + 1000000 });
+    res.json({ ok: true, newBalance: user.balance + 1000000 });
 });
 
-// ---------------------------
-// LEADERBOARD
-// ---------------------------
+// === лидеры ===
 app.get("/leaders", (req, res) => {
-  const leaders = db
-    .prepare("SELECT username, balance FROM users ORDER BY balance DESC LIMIT 50")
-    .all();
+    const rows = db.prepare(`
+        SELECT username, balance
+        FROM users
+        ORDER BY balance DESC
+        LIMIT 50
+    `).all();
 
-  res.json({ leaders });
+    res.json({ ok: true, leaders: rows });
 });
 
-// ---------------------------
-// PING (для проверки)
-// ---------------------------
-app.get("/", (req, res) => {
-  res.send("BEANBET server running ✔");
-});
-
-// ---------------------------
-// START SERVER
-// ---------------------------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server started on port " + PORT);
-});
+app.listen(3000, () => console.log("OK"));
